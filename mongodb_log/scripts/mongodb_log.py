@@ -109,7 +109,6 @@ class Barrier(object):
             self.waitcond.wait()
             self.mutex.release()
 
-
 class WorkerProcess(object):
     def __init__(self, idnum, topic, collname, in_counter_value, out_counter_value,
                  drop_counter_value, queue_maxsize,
@@ -130,8 +129,10 @@ class WorkerProcess(object):
         self.mongodb_name = mongodb_name
         self.nodename_prefix = nodename_prefix
         self.quit = Value('i', 0)
+        self.external_process = False
+        self.no_specific = False
 
-        # print "Creating process %s" % self.name
+        #print "Creating process %s" % self.name
         self.process = Process(name=self.name, target=self.run)
         # print "created %s" % self.process
         self.process.start()
@@ -173,28 +174,58 @@ class WorkerProcess(object):
                 self.subscriber = None
 
     def run(self):
-        self.init()
+        msg_class, real_topic, msg_eval = rostopic.get_topic_class(self.topic, blocking=True)
 
-        print("ACTIVE: %s" % self.name)
+        w = None
+        node_path = None
 
-        # run the thread
-        self.dequeue()
+        if not self.no_specific and msg_class == tfMessage:
+            print("DETECTED transform topic %s, using fast C++ logger" % self.topic)
+            node_path = find_node(PACKAGE_NAME, "mongodb_log_tf")
+            if not node_path:
+                print("FAILED to detect mongodb_log_tf, falling back to generic logger (did not build package?)")
+        elif not self.no_specific and msg_class == PointCloud:
+            print("DETECTED point cloud topic %s, using fast C++ logger" % self.topic)
+            node_path = find_node(PACKAGE_NAME, "mongodb_log_pcl")
+            if not node_path:
+                print("FAILED to detect mongodb_log_pcl, falling back to generic logger (did not build package?)")
+        elif not self.no_specific and msg_class == CompressedImage:
+            print("DETECTED compressed image topic %s, using fast C++ logger" % self.topic)
+            node_path = find_node(PACKAGE_NAME, "mongodb_log_cimg")
+            if not node_path:
+                print("FAILED to detect mongodb_log_cimg, falling back to generic logger (did not build package?)")
 
-        # free connection
-        # self.mongoconn.end_request()
+        if node_path:
+            self.external_process = True
+            self.run_subprocess(node_path)
+        else:
+            self.init()
+
+            print("ACTIVE: %s" % self.name)
+
+            # run the thread
+            self.dequeue()
+
+            # free connection
+            # self.mongoconn.end_request()
 
     def is_quit(self):
         return self.quit.value == 1
 
     def shutdown(self):
-        if not self.is_quit():
-            #print("SHUTDOWN %s qsize %d" % (self.name, self.queue.qsize()))
+        if self.external_process:
             self.quit.value = 1
-            self.queue.put("shutdown")
-            while not self.queue.empty(): sleep(0.1)
-        #print("JOIN %s qsize %d" % (self.name, self.queue.qsize()))
-        self.process.join()
-        self.process.terminate()
+            self.process.kill()
+            self.process.wait()
+        else:
+            if not self.is_quit():
+                #print("SHUTDOWN %s qsize %d" % (self.name, self.queue.qsize()))
+                self.quit.value = 1
+                self.queue.put("shutdown")
+                while not self.queue.empty(): sleep(0.1)
+            #print("JOIN %s qsize %d" % (self.name, self.queue.qsize()))
+            self.process.join()
+            self.process.terminate()
 
  
 
@@ -271,47 +302,16 @@ class WorkerProcess(object):
             t = self.queue.get_nowait()
         print("STOPPED: %s" % self.name)
 
-
-class SubprocessWorker(object):
-    def __init__(self, idnum, topic, collname, in_counter_value, out_counter_value,
-                 drop_counter_value, queue_maxsize,
-                 mongodb_host, mongodb_port, mongodb_name, nodename_prefix, cpp_logger):
-
-        self.name = "SubprocessWorker-%4d-%s" % (idnum, topic)
-        self.id = idnum
-        self.topic = topic
-        self.collname = collname
-        self.queue = Queue(queue_maxsize)
-        self.out_counter = Counter(out_counter_value)
-        self.in_counter  = Counter(in_counter_value)
-        self.drop_counter = Counter(drop_counter_value)
-        self.worker_out_counter = Counter()
-        self.worker_in_counter  = Counter()
-        self.worker_drop_counter = Counter()
-        self.mongodb_host = mongodb_host
-        self.mongodb_port = mongodb_port
-        self.mongodb_name = mongodb_name
-        self.nodename_prefix = nodename_prefix
-        self.quit = False
-        self.qsize = 0
-
-        self.thread = Thread(name=self.name, target=self.run)
-
-        mongodb_host_port = "%s:%d" % (mongodb_host, mongodb_port)
-        collection = "%s.%s" % (mongodb_name, collname)
+    def run_subprocess(self, node_path):
+        mongodb_host_port = "%s:%d" % (self.mongodb_host, self.mongodb_port)
+        collection = "%s.%s" % (self.mongodb_name, self.collname)
         nodename = WORKER_NODE_NAME % (self.nodename_prefix, self.id, self.collname)
         
-        self.process = subprocess.Popen([cpp_logger[0], "-t", topic, "-n", nodename,
+        self.process = subprocess.Popen([node_path[0], "-t", self.topic, "-n", nodename,
                                          "-m", mongodb_host_port, "-c", collection],
                                         stdout=subprocess.PIPE)
 
-        self.thread.start()
-
-    def qsize(self):
-        return self.qsize
-
-    def run(self):
-        while not self.quit:
+        while not self.is_quit():
             line = self.process.stdout.readline().rstrip()
             if line == "": continue
             arr = string.split(line, ":")
@@ -323,11 +323,6 @@ class SubprocessWorker(object):
             self.worker_in_counter.increment(int(arr[0]))
             self.worker_out_counter.increment(int(arr[1]))
             self.worker_drop_counter.increment(int(arr[2]))
-
-    def shutdown(self):
-        self.quit = True
-        self.process.kill()
-        self.process.wait()
 
 
 class MongoWriter(object):
@@ -408,50 +403,11 @@ class MongoWriter(object):
                 self.topics |= set([topic])
 
     def create_worker(self, idnum, topic, collname):
-        msg_class, real_topic, msg_eval = rostopic.get_topic_class(topic, blocking=True)
-
-        w = None
-        node_path = None
-        
-        if not self.no_specific and msg_class == tfMessage:
-            print("DETECTED transform topic %s, using fast C++ logger" % topic)
-            node_path = find_node(PACKAGE_NAME, "mongodb_log_tf")
-            if not node_path:
-                print("FAILED to detect mongodb_log_tf, falling back to generic logger (did not build package?)")
-        elif not self.no_specific and msg_class == PointCloud:
-            print("DETECTED point cloud topic %s, using fast C++ logger" % topic)
-            node_path = find_node(PACKAGE_NAME, "mongodb_log_pcl")
-            if not node_path:
-                print("FAILED to detect mongodb_log_pcl, falling back to generic logger (did not build package?)")
-        elif not self.no_specific and msg_class == CompressedImage:
-            print("DETECTED compressed image topic %s, using fast C++ logger" % topic)
-            node_path = find_node(PACKAGE_NAME, "mongodb_log_cimg")
-            if not node_path:
-                print("FAILED to detect mongodb_log_cimg, falling back to generic logger (did not build package?)")
-        """
-        elif msg_class == TriangleMesh:
-            print("DETECTED triangle mesh topic %s, using fast C++ logger" % topic)
-            node_path = find_node(PACKAGE_NAME, "mongodb_log_trimesh")
-            if not node_path:
-                print("FAILED to detect mongodb_log_trimesh, falling back to generic logger (did not build package?)")
-        """
-
-        if node_path:
-            w = SubprocessWorker(idnum, topic, collname,
-                                 self.in_counter.count, self.out_counter.count,
-                                 self.drop_counter.count, QUEUE_MAXSIZE,
-                                 self.mongodb_host, self.mongodb_port, self.mongodb_name,
-                                 self.nodename_prefix, node_path)
-
-        if not w:
-            print("GENERIC Python logger used for topic %s" % topic)
-            w = WorkerProcess(idnum, topic, collname,
-                              self.in_counter.count, self.out_counter.count,
-                              self.drop_counter.count, QUEUE_MAXSIZE,
-                              self.mongodb_host, self.mongodb_port, self.mongodb_name,
-                              self.nodename_prefix)
-        
-        return w
+        return WorkerProcess(idnum, topic, collname,
+                             self.in_counter.count, self.out_counter.count,
+                             self.drop_counter.count, QUEUE_MAXSIZE,
+                             self.mongodb_host, self.mongodb_port, self.mongodb_name,
+                             self.nodename_prefix)
 
 
     def run(self):
